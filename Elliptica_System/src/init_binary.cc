@@ -63,13 +63,13 @@ void Elliptica_load_initial_data(CCTK_ARGUMENTS)
   FILE *file = fopen(Elliptica_id_file, "r");
   if (!file)
   {
-    fclose(file);
-  }
-  else
-  {
     CCTK_VError(
       __LINE__, __FILE__, CCTK_THORNSTRING,
       "File \"%s\" does not exist. ABORTING", Elliptica_id_file);
+  }
+  else
+  {
+    fclose(file);
   }
   // when using EOS, check for EOS file.
   //if (strlen(eos_table_filepath) > 0) {
