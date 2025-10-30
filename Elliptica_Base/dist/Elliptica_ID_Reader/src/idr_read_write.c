@@ -319,6 +319,10 @@ void
     for (p = 0; p < npoints; ++p)
     {
       Patch_T *patch  = grid->patch[pnt->patchn[p]];
+      Interpolation_T *interp_s = pnt->interp_s[p];
+      // each point can take different field
+      interp_s->field = patch->fields[pnt->f_index[patch->pn][f]];
+      /*
       Interpolation_T *interp_s = init_interpolation();
       interp_s->field = patch->fields[pnt->f_index[patch->pn][f]];
       interp_s->XYZ_dir_flag = 1;
@@ -326,8 +330,9 @@ void
       interp_s->Y = pnt->Y[p];
       interp_s->Z = pnt->Z[p];
       plan_interpolation(interp_s);
+      */
       interp_v[p] = execute_interpolation(interp_s);
-      free_interpolation(interp_s);
+      //free_interpolation(interp_s);
     }
     
     for (p = 0; p < npoints; ++p)
@@ -363,6 +368,90 @@ void
   free_2d_mem(pnt->f_index,grid->np);
   pnt->f_index = 0;
 }
+
+/* populate ifield coeffs for a MT safe interpolation.
+// NOTE: this function itself is not MT safe. */
+void idr_set_ifield_coeffs(Elliptica_ID_Reader_T *const idr)
+{
+  Grid_T *const grid = idr->grid;
+  char **fields_name = idr->id_field_names;// elliptica field names we need
+  Uint p;
+  
+  /* some checks */
+  if (!grid)
+    Error1("Grid is empty!");
+  
+  if (!fields_name)
+    Error1("No fields given!");
+
+  /* to avoid race condition between threads write all coeffs */
+  OpenMP_Patch_Pragma(omp parallel for)
+  for (p = 0; p < grid->np; ++p)
+  {
+    Patch_T *patch = grid->patch[p];
+    Uint fn = 0;
+    
+    while(fields_name[fn])
+    {
+      Field_T *field = patch->fields[Ind(fields_name[fn])];
+      make_coeffs_3d(field);
+      fn++;
+    }
+  }
+}
+
+/* this is an MT safe interpolatation when use for ID reader routine 
+// note: x,y,z are Cartesian coords of the evolution code.
+// ex: double gxx = idr->fieldx(idr,"adm_gxx",x,y,z);
+// ->return: interpolated value of the field at the given points. */
+double idr_interpolate_field_thread_safe(
+  Elliptica_ID_Reader_T *const idr, 
+  const char *const field_name, const double x,const double y, const double z)
+{
+  Grid_T *const grid = idr->grid;
+  Patch_T *patch = 0;
+  double X[3] = {0.};
+  double x_ell[3] = {0.}; // x coords in the ID coord. system
+
+  // shift coords and find X
+  x_ell[0] = x + idr->id_CM[0];
+  x_ell[1] = y + idr->id_CM[1];
+  x_ell[2] = z + idr->id_CM[2];
+  patch = x_in_which_patch(x_ell,grid->patch,grid->np);
+  if (!patch || !X_of_x(X,x_ell,patch))
+  {
+    char errmsg[STR_LEN_MAX] = {'\0'};
+    sprintf(errmsg,"It could not find X(%f,%f,%f)!\n",x_ell[0],x_ell[1],x_ell[2]);
+    Error1(errmsg);
+  }
+  
+  // find field
+  int f_indx = Ind( idr->id_field_names[idr->indx(field_name)] );
+  
+  // interpolate and return
+  return interpolate_at_this_pnt(patch->fields[f_indx],X);
+}
+
+/* given field and coordinates, interpolate the field at the given point
+// note: the given point X should be in code coordinates, i.e., XYZ coords.
+// ->return: interpolated value of the field at the given points */
+static double interpolate_at_this_pnt(Field_T *const field, const double X[3])
+{
+  Interpolation_T *interp_s = init_interpolation();
+  double ret = DBL_MAX;
+  
+  interp_s->field = field;
+  interp_s->XYZ_dir_flag = 1;
+  interp_s->X = X[0];
+  interp_s->Y = X[1];
+  interp_s->Z = X[2];
+  plan_interpolation(interp_s);
+  ret = execute_interpolation(interp_s);
+  free_interpolation(interp_s);
+  
+  return ret;
+}
+
 
 /* -> binary file to write
 // open new binary file and add appropriate header for export purposes.
@@ -422,7 +511,15 @@ void idr_free(ID_Reader_T *pnt)
   Free(pnt->patchn);
   free_2d_mem(pnt->f_index,pnt->grid->np);
   pnt->f_index = 0;
-  
+	
+	if (pnt->interp_s)
+	{
+		for (Uint p = 0; p < pnt->npoints; ++p)
+		{
+			free_interpolation(pnt->interp_s[p]);
+		}
+		Free(pnt->interp_s);
+	}
   Free(pnt);
 }
 
@@ -449,9 +546,11 @@ void idr_find_XYZ_from_xyz(Elliptica_ID_Reader_T *const idr,
   pnt->npoints = npoints = (Uint)idr->npoints;
   pnt->X       = alloc_double(npoints);
   pnt->Y       = alloc_double(npoints);
-  pnt->Z       = alloc_double(npoints);  
+  pnt->Z       = alloc_double(npoints);
   pnt->patchn  = calloc(npoints,sizeof(*pnt->patchn));
   IsNull(pnt->patchn);
+  pnt->interp_s = calloc(npoints,sizeof(*pnt->interp_s));
+  IsNull(pnt->interp_s);
   printf(Pretty0"number of points to interpolate = %u\n",npoints);
 
   /* populating pnt->(X,Y,Z) and pnt->patchn */
@@ -473,6 +572,17 @@ void idr_find_XYZ_from_xyz(Elliptica_ID_Reader_T *const idr,
       pnt->Y[p]      = X[1];
       pnt->Z[p]      = X[2];
       pnt->patchn[p] = patch->pn;
+      // setup interpolation scheme
+      pnt->interp_s[p] = init_interpolation();
+      // choose the very first field of this patch, NOT ideal!
+      assert(patch->fields);
+      assert(patch->fields[0]);
+      pnt->interp_s[p]->field = patch->fields[0];
+      pnt->interp_s[p]->XYZ_dir_flag = 1;
+      pnt->interp_s[p]->X = pnt->X[p];
+      pnt->interp_s[p]->Y = pnt->Y[p];
+      pnt->interp_s[p]->Z = pnt->Z[p];
+      plan_interpolation(pnt->interp_s[p]);
     }
     else
     {
