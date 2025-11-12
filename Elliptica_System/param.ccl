@@ -42,6 +42,11 @@ EXTENDS keyword initial_temperature
   "Elliptica" :: "Initial temperature from Elliptica"
 }
 
+EXTENDS keyword initial_entropy
+{
+  "Elliptica" :: "Initial entropy from Elliptica"
+}
+
 EXTENDS keyword initial_Y_e
 {
   "Elliptica" :: "Initial Y_e from Elliptica"
